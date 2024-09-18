@@ -10,6 +10,7 @@ import psutil
 from datetime import datetime, timedelta
 
 stop_flag = threading.Event()
+lock = threading.Lock()  # Lock to ensure thread safety
 
 def terminate_process(process, worker_id):
     if process is None:
@@ -24,7 +25,7 @@ def terminate_process(process, worker_id):
             child.terminate()
         parent.terminate()
 
-        gone, alive = psutil.wait_procs(children + [parent], timeout=3)
+        gone, alive = psutil.wait_procs(children + [parent], timeout=5)
         
         for p in alive:
             print(f"Worker {worker_id}: Force killing process {p.pid}")
@@ -53,17 +54,17 @@ def run_worker(command, worker_id, silent, no_inference_timeout):
 
     process = None
     last_inference_time = datetime.now()
-    
+
     while not stop_flag.is_set():
-        if process is None or process.poll() is not None:
-            if process is not None:
-                print(f"Worker {worker_id}: Restarting")
-                terminate_process(process, worker_id)
-            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, universal_newlines=True)
-            last_inference_time = datetime.now()
+        with lock:
+            if process is None or process.poll() is not None:
+                if process is not None:
+                    print(f"Worker {worker_id}: Restarting")
+                    terminate_process(process, worker_id)
+                process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, universal_newlines=True)
+                last_inference_time = datetime.now()
 
         try:
-            # Use select for non-blocking read with a timeout
             ready, _, _ = select.select([process.stdout], [], [], 60.0)  # 60-second timeout
             if ready:
                 line = process.stdout.readline()
@@ -77,28 +78,31 @@ def run_worker(command, worker_id, silent, no_inference_timeout):
                     last_inference_time = datetime.now()
             else:
                 # No output for 60 seconds, check if process is still responsive
-                if process.poll() is None:
-                    print(f"Worker {worker_id}: No output for 60 seconds. Checking process...")
-                    # Send a signal to the process to check if it's responsive
-                    process.send_signal(signal.SIGURG)
-                    time.sleep(1)
+                with lock:
                     if process.poll() is None:
-                        print(f"Worker {worker_id}: Process is still running but unresponsive. Restarting...")
-                        terminate_process(process, worker_id)
-                        process = None
-                        last_inference_time = datetime.now()
+                        print(f"Worker {worker_id}: No output for 60 seconds. Checking process...")
+                        # Send a signal to the process to check if it's responsive
+                        process.send_signal(signal.SIGURG)
+                        time.sleep(1)
+                        if process.poll() is None:
+                            print(f"Worker {worker_id}: Process is still running but unresponsive. Restarting...")
+                            terminate_process(process, worker_id)
+                            process = None
+                            last_inference_time = datetime.now()
                 
             if datetime.now() - last_inference_time > timedelta(minutes=no_inference_timeout):
                 print(f"Worker {worker_id}: No inference finished for {no_inference_timeout} minutes. Restarting...")
-                terminate_process(process, worker_id)
-                process = None
-                last_inference_time = datetime.now()
+                with lock:
+                    terminate_process(process, worker_id)
+                    process = None
+                    last_inference_time = datetime.now()
 
         except Exception as e:
             print(f"Worker {worker_id}: Error - {str(e)}. Restarting...")
-            terminate_process(process, worker_id)
-            process = None
-            time.sleep(5)  # Wait a bit before restarting to avoid rapid restarts in case of persistent errors
+            with lock:
+                terminate_process(process, worker_id)
+                process = None
+                time.sleep(5)  # Wait a bit before restarting to avoid rapid restarts in case of persistent errors
 
     if process:
         print(f"Worker {worker_id}: Stopping")
